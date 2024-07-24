@@ -7,46 +7,59 @@
 #include <linux/uinput.h>
 #include <dirent.h>
 #include <linux/input-event-codes.h>
-#include <time.h>
+#include <errno.h>
+#include <sys/select.h>
+#include <syslog.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <libevdev/libevdev.h>
 
 #define MAX_KEYS 256
 #define MAX_DEVICE_PATH 256
-#define MAX_KEYBOARDS 10
+#define MAX_KEYBOARDS 5
 
 typedef struct {
     int fd;
-    char path[MAX_DEVICE_PATH];
-    char name[256];
+    struct libevdev *evdev;
 } Keyboard;
 
-Keyboard keyboards[MAX_KEYBOARDS];
-int keyboard_count = 0;
+static Keyboard keyboards[MAX_KEYBOARDS];
+static int keyboard_count = 0;
+static int uifd;
+static char key_state[MAX_KEYS] = {0};
+static char last_key = 0;
+static volatile sig_atomic_t keep_running = 1;
 
-void find_keyboards() {
-    DIR* dir;
+static inline int is_keyboard(struct libevdev *dev) {
+    return libevdev_has_event_type(dev, EV_KEY) &&
+           libevdev_has_event_code(dev, EV_KEY, KEY_A) &&
+           libevdev_has_event_code(dev, EV_KEY, KEY_Z);
+}
+
+static void find_keyboards(void) {
+    DIR* dir = opendir("/dev/input");
+    if (!dir) return;
+
     struct dirent* ent;
     char event_path[MAX_DEVICE_PATH];
 
-    dir = opendir("/dev/input");
-    if (dir == NULL) {
-        perror("Error opening /dev/input");
-        return;
-    }
-
     while ((ent = readdir(dir)) != NULL && keyboard_count < MAX_KEYBOARDS) {
         if (strncmp(ent->d_name, "event", 5) == 0) {
-            snprintf(event_path, sizeof(event_path), "/dev/input/%s", ent->d_name);
+            if (snprintf(event_path, sizeof(event_path), "/dev/input/%s", ent->d_name) >= sizeof(event_path)) {
+                fprintf(stderr, "Event path too long: %s\n", ent->d_name);
+                continue;
+            }
             int fd = open(event_path, O_RDONLY);
             if (fd != -1) {
-                char name[256];
-                if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0) {
-                    if (strstr(name, "keyboard") != NULL || strstr(name, "Keyboard") != NULL) {
+                struct libevdev *evdev = NULL;
+                if (libevdev_new_from_fd(fd, &evdev) == 0) {
+                    if (is_keyboard(evdev)) {
                         keyboards[keyboard_count].fd = fd;
-                        strncpy(keyboards[keyboard_count].path, event_path, MAX_DEVICE_PATH);
-                        strncpy(keyboards[keyboard_count].name, name, sizeof(name));
+                        keyboards[keyboard_count].evdev = evdev;
                         keyboard_count++;
-                        printf("Found keyboard %d: %s (%s)\n", keyboard_count, name, event_path);
+                        printf("Found keyboard: %s\n", event_path);
                     } else {
+                        libevdev_free(evdev);
                         close(fd);
                     }
                 } else {
@@ -57,10 +70,10 @@ void find_keyboards() {
     }
     closedir(dir);
 }
-void setup_uinput_device(int uifd) {
+
+static void setup_uinput_device(void) {
     struct uinput_setup usetup;
 
-    // Enable key events
     ioctl(uifd, UI_SET_EVBIT, EV_KEY);
     for (int i = 0; i < KEY_MAX; i++) {
         ioctl(uifd, UI_SET_KEYBIT, i);
@@ -68,184 +81,165 @@ void setup_uinput_device(int uifd) {
 
     memset(&usetup, 0, sizeof(usetup));
     usetup.id.bustype = BUS_USB;
-    usetup.id.vendor = 0x1234;  // dummy vendor
-    usetup.id.product = 0x5678;  // dummy product
+    usetup.id.vendor = 0x1234;
+    usetup.id.product = 0x5678;
     strcpy(usetup.name, "Null Movement Keyboard");
 
     ioctl(uifd, UI_DEV_SETUP, &usetup);
     ioctl(uifd, UI_DEV_CREATE);
 }
 
-const char* get_key_name(int code) {
-    static char buf[32];
-    switch(code) {
-        case KEY_A: return "A";
-        case KEY_B: return "B";
-        case KEY_C: return "C";
-        case KEY_D: return "D";
-        case KEY_E: return "E";
-        case KEY_F: return "F";
-        case KEY_G: return "G";
-        case KEY_H: return "H";
-        case KEY_I: return "I";
-        case KEY_J: return "J";
-        case KEY_K: return "K";
-        case KEY_L: return "L";
-        case KEY_M: return "M";
-        case KEY_N: return "N";
-        case KEY_O: return "O";
-        case KEY_P: return "P";
-        case KEY_Q: return "Q";
-        case KEY_R: return "R";
-        case KEY_S: return "S";
-        case KEY_T: return "T";
-        case KEY_U: return "U";
-        case KEY_V: return "V";
-        case KEY_W: return "W";
-        case KEY_X: return "X";
-        case KEY_Y: return "Y";
-        case KEY_Z: return "Z";
-        case KEY_SPACE: return "SPACE";
-        case KEY_ENTER: return "ENTER";
-        case KEY_BACKSPACE: return "BACKSPACE";
-        case KEY_LEFTSHIFT: return "LEFT SHIFT";
-        case KEY_RIGHTSHIFT: return "RIGHT SHIFT";
-        case KEY_LEFTCTRL: return "LEFT CTRL";
-        case KEY_RIGHTCTRL: return "RIGHT CTRL";
-        case KEY_LEFTALT: return "LEFT ALT";
-        case KEY_RIGHTALT: return "RIGHT ALT";
-        default:
-            snprintf(buf, sizeof(buf), "KEY %d", code);
-            return buf;
+static const char* get_key_name(int code) {
+    static const char* key_names[] = {
+        [KEY_A] = "A", [KEY_B] = "B", [KEY_C] = "C", [KEY_D] = "D", [KEY_E] = "E",
+        [KEY_F] = "F", [KEY_G] = "G", [KEY_H] = "H", [KEY_I] = "I", [KEY_J] = "J",
+        [KEY_K] = "K", [KEY_L] = "L", [KEY_M] = "M", [KEY_N] = "N", [KEY_O] = "O",
+        [KEY_P] = "P", [KEY_Q] = "Q", [KEY_R] = "R", [KEY_S] = "S", [KEY_T] = "T",
+        [KEY_U] = "U", [KEY_V] = "V", [KEY_W] = "W", [KEY_X] = "X", [KEY_Y] = "Y",
+        [KEY_Z] = "Z", [KEY_SPACE] = "SPACE", [KEY_ENTER] = "ENTER",
+        [KEY_BACKSPACE] = "BACKSPACE", [KEY_LEFTSHIFT] = "LEFT SHIFT",
+        [KEY_RIGHTSHIFT] = "RIGHT SHIFT", [KEY_LEFTCTRL] = "LEFT CTRL",
+        [KEY_RIGHTCTRL] = "RIGHT CTRL", [KEY_LEFTALT] = "LEFT ALT",
+        [KEY_RIGHTALT] = "RIGHT ALT"
+    };
+    return (code < sizeof(key_names)/sizeof(key_names[0]) && key_names[code]) ? key_names[code] : "UNKNOWN";
+}
+
+static inline void write_event(int type, int code, int value) {
+    struct input_event ev = {.type = type, .code = code, .value = value};
+    ssize_t bytes_written = write(uifd, &ev, sizeof(ev));
+    if (bytes_written != sizeof(ev)) {
+        fprintf(stderr, "Failed to write event: %s\n", strerror(errno));
     }
 }
 
-struct timespec get_time() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts;
+static void signal_handler(int signum) {
+    keep_running = 0;
 }
 
-long long timespec_diff_ns(struct timespec start, struct timespec end) {
-    return (end.tv_sec - start.tv_sec) * 1000000000LL + (end.tv_nsec - start.tv_nsec);
+static void daemonize(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        exit(EXIT_FAILURE);
+    }
+    if (pid > 0) {
+        exit(EXIT_SUCCESS);
+    }
+    if (setsid() < 0) {
+        exit(EXIT_FAILURE);
+    }
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    pid = fork();
+    if (pid < 0) {
+        exit(EXIT_FAILURE);
+    }
+    if (pid > 0) {
+        exit(EXIT_SUCCESS);
+    }
+    umask(0);
+    if (chdir("/") < 0) {
+        fprintf(stderr, "Failed to change directory\n");
+        exit(EXIT_FAILURE);
+    }
+    for (int x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
+        close(x);
+    }
+    openlog("null_movement_keyboard", LOG_PID, LOG_DAEMON);
 }
 
-int main() {
-    int uifd;
-    char key_state[MAX_KEYS] = {0};
-    char last_key = 0;
-    struct timespec start_time, end_time;
-    struct input_event ev;
-    int chosen_keyboard;
+int main(void) {
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+
+    printf("Null Movement Keyboard starting\n");
 
     find_keyboards();
     if (keyboard_count == 0) {
         fprintf(stderr, "No keyboards found\n");
-        exit(1);
+        return 1;
     }
-
-    printf("Choose a keyboard (1-%d): ", keyboard_count);
-    if (scanf("%d", &chosen_keyboard) != 1 || chosen_keyboard < 1 || chosen_keyboard > keyboard_count) {
-        fprintf(stderr, "Invalid choice\n");
-        exit(1);
-    }
-    chosen_keyboard--; // Adjust for 0-based index
-
-    printf("Using keyboard: %s\n", keyboards[chosen_keyboard].name);
 
     uifd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (uifd < 0) {
-        perror("Error opening uinput");
-        exit(1);
+        fprintf(stderr, "Error opening uinput: %s\n", strerror(errno));
+        return 1;
     }
 
-    setup_uinput_device(uifd);
+    setup_uinput_device();
 
-    printf("Null Movement Keyboard initialized. Press Ctrl+C to exit.\n");
+    fd_set readfds;
+    int max_fd = -1;
+    struct input_event ev;
+    int click_count = 0;
 
-    while (1) {
-        if (read(keyboards[chosen_keyboard].fd, &ev, sizeof(struct input_event)) < 0) {
-            perror("Error reading event");
-            break;
+    printf("Press any key 10 times to start daemonization...\n");
+
+    while (keep_running) {
+        FD_ZERO(&readfds);
+        for (int i = 0; i < keyboard_count; i++) {
+            FD_SET(keyboards[i].fd, &readfds);
+            if (keyboards[i].fd > max_fd) max_fd = keyboards[i].fd;
         }
 
-        if (ev.type == EV_KEY) {
-            start_time = get_time();
-            const char* key_name = get_key_name(ev.code);
-            if (ev.value == 1) {
-                printf("Key pressed: %s\n", key_name);
-            } else if (ev.value == 0) {
-                printf("Key released: %s\n", key_name);
-            }
+        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0 && errno != EINTR) break;
 
-            if (ev.value == 1 || ev.value == 2) {  // Key pressed or held
-                key_state[ev.code] = 1;
-                if (last_key != 0 && last_key != ev.code) {
-                    // Send key release for the previous key
-                    struct input_event release_ev = {
-                        .type = EV_KEY,
-                        .code = last_key,
-                        .value = 0
-                    };
-                    write(uifd, &release_ev, sizeof(struct input_event));
-                    struct input_event sync_ev = {
-                        .type = EV_SYN,
-                        .code = SYN_REPORT,
-                        .value = 0
-                    };
-                    write(uifd, &sync_ev, sizeof(struct input_event));
-                    printf("Released previous key: %s\n", get_key_name(last_key));
-                }
-                last_key = ev.code;
-            } else if (ev.value == 0) {  // Key released
-                key_state[ev.code] = 0;
-                if (ev.code == last_key) {
-                    // Find the next pressed key, if any
-                    last_key = 0;
-                    for (int i = 0; i < MAX_KEYS; i++) {
-                        if (key_state[i]) {
-                            last_key = i;
-                            break;
+        if (!keep_running) break;
+
+        for (int i = 0; i < keyboard_count; i++) {
+            if (FD_ISSET(keyboards[i].fd, &readfds)) {
+                int rc;
+                while ((rc = libevdev_next_event(keyboards[i].evdev, LIBEVDEV_READ_FLAG_NORMAL, &ev)) == 0) {
+                    if (ev.type == EV_KEY) {
+                        const char* key_name = get_key_name(ev.code);
+                        if (ev.value == 1) {
+                            printf("Key pressed: %s\n", key_name);
+                            click_count++;
+                            if (click_count == 10) {
+                                printf("Daemonizing...\n");
+                                daemonize();
+                                syslog(LOG_INFO, "Null Movement Keyboard daemon started");
+                            }
+                            key_state[ev.code] = 1;
+                            if (last_key && last_key != ev.code) {
+                                write_event(EV_KEY, last_key, 0);
+                                write_event(EV_SYN, SYN_REPORT, 0);
+                            }
+                            last_key = ev.code;
+                        } else if (ev.value == 0) {
+                            printf("Key released: %s\n", key_name);
+                            key_state[ev.code] = 0;
+                            if (ev.code == last_key) {
+                                last_key = 0;
+                                for (int j = 0; j < MAX_KEYS; j++) {
+                                    if (key_state[j]) {
+                                        last_key = j;
+                                        write_event(EV_KEY, last_key, 1);
+                                        write_event(EV_SYN, SYN_REPORT, 0);
+                                        break;
+                                    }
+                                }
+                            }
                         }
-                    }
-                    if (last_key != 0) {
-                        // Send key press for the next key
-                        struct input_event press_ev = {
-                            .type = EV_KEY,
-                            .code = last_key,
-                            .value = 1
-                        };
-                        write(uifd, &press_ev, sizeof(struct input_event));
-                        struct input_event sync_ev = {
-                            .type = EV_SYN,
-                            .code = SYN_REPORT,
-                            .value = 0
-                        };
-                        write(uifd, &sync_ev, sizeof(struct input_event));
-                        printf("Pressed next key: %s\n", get_key_name(last_key));
+                        write_event(ev.type, ev.code, ev.value);
+                        write_event(EV_SYN, SYN_REPORT, 0);
                     }
                 }
+                if (rc != -EAGAIN && rc != -EINTR) {
+                    fprintf(stderr, "Error reading event: %s\n", strerror(-rc));
+                }
             }
-            // Send the modified event
-            write(uifd, &ev, sizeof(struct input_event));
-            struct input_event sync_ev = {
-                .type = EV_SYN,
-                .code = SYN_REPORT,
-                .value = 0
-            };
-            write(uifd, &sync_ev, sizeof(struct input_event));
-
-            end_time = get_time();
-            long long duration_ns = timespec_diff_ns(start_time, end_time);
-            printf("Processing time: %lld ns\n", duration_ns);
         }
     }
 
-    // Clean up
+    printf("Null Movement Keyboard shutting down\n");
+
     ioctl(uifd, UI_DEV_DESTROY);
     close(uifd);
     for (int i = 0; i < keyboard_count; i++) {
+        libevdev_free(keyboards[i].evdev);
         close(keyboards[i].fd);
     }
+
     return 0;
 }
